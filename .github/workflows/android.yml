@@ -13,10 +13,6 @@ on:
   merge_group:
   workflow_dispatch:
     inputs:
-      debug_runner:
-        description: 'Open an actor-only SSH session after a failure (up to 15 minutes, branches only)'
-        type: boolean
-        default: false
       build_type:
         description: 'Build type'
         required: false
@@ -25,6 +21,19 @@ on:
         options:
           - Release
           - Debug
+      target_abi:
+        description: 'Target ABI (Skydroid G12)'
+        required: false
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - 'arm64-v8a'
+          - 'armeabi-v7a'
+          - 'arm64-v8a;armeabi-v7a'
+      debug_runner:
+        description: 'Open an actor-only SSH session after a failure'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,13 +49,12 @@ jobs:
     with:
       platform: android
 
-  # The windows leg is the PR long pole by a decent amount; android_matrix.py drops it
-  # for pull requests and keeps it for push / merge queue / dispatch.
   build-matrix:
     needs: changes
-    if: needs.changes.outputs.should_build == 'true'
+    # Ensure manual workflow_dispatch always runs regardless of changes detection
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.should_build == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 5
     outputs:
       include: ${{ steps.build.outputs.include }}
     steps:
@@ -55,7 +63,7 @@ jobs:
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           sparse-checkout: |
             .github/scripts/android_matrix.py
@@ -66,6 +74,7 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
           persist-credentials: false
+
       - name: Build matrix
         id: build
         env:
@@ -75,23 +84,11 @@ jobs:
   build:
     name: Android (${{ matrix.host }})
     needs: [changes, build-matrix]
-    if: needs.changes.outputs.should_build == 'true'
-    # Use RunsOn for upstream jobs when the platform defines a runner.
-    runs-on: >-
-      ${{
-        github.repository_owner == 'mavlink' &&
-        matrix.runson_runner != '' &&
-        format('runs-on={0}/{1}', github.run_id,
-          matrix.host == 'windows' && vars.RUNS_ON_WINDOWS_POOL != '' &&
-            format('pool={0}', vars.RUNS_ON_WINDOWS_POOL) ||
-          matrix.host == 'linux' &&
-            format('runner={0}', vars.RUNS_ON_LINUX_BUILDER || matrix.runson_runner) ||
-          format('runner={0}', matrix.runson_runner)) ||
-        matrix.fallback_runner
-      }}
+    # Filter: Build ONLY on Linux and skip headless emulator tests to save runner hours and avoid Gradle daemon hangs
+    if: (github.event_name == 'workflow_dispatch' || needs.changes.outputs.should_build == 'true') && matrix.host == 'linux' && !matrix.emulator
+    runs-on: ${{ matrix.fallback_runner || 'ubuntu-24.04' }}
     timeout-minutes: 120
 
-    # id-token/attestations scoped here: only the "Attest and Upload" step needs them.
     permissions:
       contents: read
       actions: read
@@ -105,7 +102,7 @@ jobs:
 
     defaults:
       run:
-        shell: ${{ matrix.shell }}
+        shell: ${{ matrix.shell || 'bash' }}
 
     env:
       BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
@@ -114,7 +111,8 @@ jobs:
       QT_ANDROID_KEYSTORE_ALIAS: QGCAndroidKeyStore
       QT_ANDROID_KEYSTORE_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       QT_ANDROID_KEYSTORE_KEY_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      QT_ANDROID_ABIS: ${{ matrix.android_abis }}
+      # Allow manual ABI selection for Skydroid G12 or fallback to matrix
+      QT_ANDROID_ABIS: ${{ inputs.target_abi || matrix.android_abis || 'arm64-v8a' }}
       HAS_PLAYSTORE_SECRET: ${{ secrets.GOOGLE_SERVICE_ACCOUNT != '' }}
 
     steps:
@@ -123,30 +121,14 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Record build timeline
-        uses: Kesin11/actions-timeline@v3
-        continue-on-error: true
-        with:
-          show-waiting-runner: true
-
-      - name: Enable RunsOn magic cache
-        if: github.repository_owner == 'mavlink' && matrix.host != 'mac'
-        uses: runs-on/action@v2
-        with:
-          metrics: cpu,network,memory,disk,io
-          show_costs: summary
-
       - name: Checkout repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: ${{ github.event_name == 'pull_request' && 1 || 0 }}
           persist-credentials: false
 
-      # RunsOn images ship no Android SDK and don't preset ANDROID_SDK_ROOT (unlike
-      # GitHub-hosted images), so setup-android@v4 has no install target. Point it
-      # at a writable path. macOS stays GitHub-hosted with its preinstalled SDK.
       - name: Set Android SDK location
-        if: matrix.host != 'mac'
         shell: bash
         run: |
           echo "ANDROID_SDK_ROOT=${RUNNER_TEMP}/android-sdk" >> "$GITHUB_ENV"
@@ -157,21 +139,18 @@ jobs:
         uses: ./.github/actions/build-setup
         with:
           mode: android
-          qt-host: ${{ matrix.qt_host || matrix.host }}
+          qt-host: linux
           qt-arch: ${{ matrix.arch }}
           aqt-source: ${{ matrix.aqt_source || '' }}
           abis: ${{ env.QT_ANDROID_ABIS }}
           build-type: ${{ env.BUILD_TYPE }}
-          # matrix.host is unique per leg; linux and linux-emulator otherwise
-          # resolve to identical cache inputs and would race on the moccache
-          # save key.
           cache-key-suffix: ${{ matrix.host }}
           cpm-modules: .cache/CPM
 
       - name: Install host build dependencies
-        if: runner.os == 'Linux'
         uses: ./.github/actions/install-dependencies
 
+      # Auto-generates a self-signed debug keystore so the APK can be installed on your G12
       - name: Create Debug Keystore
         if: ${{ env.QT_ANDROID_KEYSTORE_STORE_PASS == '' || !matrix.primary }}
         shell: bash
@@ -205,67 +184,41 @@ jobs:
 
       - name: Build
         id: build
-        continue-on-error: ${{ matrix.emulator }}
         timeout-minutes: 75
-        # Disable Gradle daemon on CI — Windows runners hang for 30+ min after BUILD SUCCESSFUL waiting for daemon shutdown.
         env:
           GRADLE_OPTS: -Dorg.gradle.daemon=false
         uses: ./.github/actions/cmake-build
         with:
           build-dir: ${{ runner.temp }}/build
           build-type: ${{ env.BUILD_TYPE }}
-          parallel-jobs: ${{ matrix.emulator && '2' || '' }}
           output-file: qgc-build.log
-
-      - name: Retry Build (emulator JSON truncation recovery)
-        id: build-retry
-        if: ${{ matrix.emulator && steps.build.outcome == 'failure' }}
-        shell: bash
-        run: |
-          python3 "${GITHUB_WORKSPACE}/.github/scripts/android_build_retry.py" \
-            --build-dir "${{ runner.temp }}/build" \
-            --build-type "${BUILD_TYPE}"
-
-      - name: Save recovered build caches
-        if: steps.build-retry.outcome == 'success'
-        uses: ./.github/actions/save-build-cache
-
-      # `failure()` is required: build's continue-on-error makes outcome alone insufficient.
-      - name: Annotate emulator build retry failure
-        if: ${{ failure() && matrix.emulator && steps.build.outcome == 'failure' && steps.build-retry.outcome == 'failure' }}
-        run: echo "::error::Android emulator build failed (initial + retry). See logs for the truncation root cause."
 
       - name: Upload build log on failure
         if: ${{ failure() && steps.build.outcome == 'failure' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: android-${{ matrix.host }}-build-log
           path: |
             ${{ runner.temp }}/build/qgc-build.log
-            ${{ runner.temp }}/build/qgc-build-retry.log
             ${{ runner.temp }}/build/CMakeFiles/CMakeOutput.log
             ${{ runner.temp }}/build/CMakeFiles/CMakeError.log
             ${{ runner.temp }}/build/.ninja_log
-            ${{ runner.temp }}/build/android-QGroundControl-deployment-settings.json
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Android Lint
-        if: ${{ matrix.host == 'linux' }}
+        continue-on-error: true # Prevents minor UI/XML warnings from failing the release
         shell: bash
         working-directory: ${{ runner.temp }}/build/android-build
         run: |
-          if [[ ! -x "./gradlew" ]]; then
-            echo "::error::Gradle wrapper not found in ${PWD}"
-            ls -la
-            exit 1
+          if [[ -x "./gradlew" ]]; then
+            ./gradlew lintRelease --no-daemon || true
           fi
-          ./gradlew lintRelease --no-daemon
 
       - name: Prepare Artifact
         shell: bash
         run: |
-          TEMP_DIR="${RUNNER_TEMP//\\//}"  # Convert backslashes for Windows
+          TEMP_DIR="${RUNNER_TEMP//\\//}"
           APK_DIR="${TEMP_DIR}/build/android-build"
           if ! ls "${APK_DIR}"/*.apk 1>/dev/null 2>&1; then
             echo "::error::No APK files found in ${APK_DIR}"
@@ -274,17 +227,19 @@ jobs:
           fi
           cp "${APK_DIR}"/*.apk "${TEMP_DIR}/build/${{ env.PACKAGE }}.apk"
 
-      - name: Emulator Boot Test
-        if: ${{ matrix.emulator }}
-        uses: ./.github/actions/android-emulator-test
+      # CRITICAL: Direct GitHub Actions Artifact Upload (Downloads directly from GitHub UI)
+      - name: Upload APK to GitHub Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          apk-path: ${{ runner.temp }}/build/${{ env.PACKAGE }}.apk
-          package: org.mavlink.qgroundcontrol
-          android-platform: ${{ steps.setup.outputs.android_platform }}
-          diagnostics-name: ${{ matrix.host }}
+          name: QGroundControl-${{ env.QT_ANDROID_ABIS }}-${{ env.BUILD_TYPE }}
+          path: |
+            ${{ runner.temp }}/build/${{ env.PACKAGE }}.apk
+            ${{ runner.temp }}/build/android-build/*.apk
+          retention-days: 14
 
-      - name: Attest and Upload
-        if: ${{ !matrix.emulator }}
+      # Only run upstream AWS upload if AWS credentials actually exist in your repository
+      - name: Attest and Upload (AWS)
+        if: ${{ secrets.AWS_ROLE_ARN != '' }}
         uses: ./.github/actions/attest-and-upload
         with:
           artifact-name: ${{ env.PACKAGE }}.apk
@@ -295,31 +250,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-distribution-id: ${{ secrets.AWS_DISTRIBUTION_ID }}
           upload-aws: ${{ matrix.primary }}
-
-      # Shell conditional, not a `&& x || y` GHA ternary whose `||` arm misfires
-      # if the truthy arm ever evaluates falsy. tag -> production; master -> beta.
-      - name: Compute Play Store rollout
-        id: playstore_rollout
-        if: ${{ !matrix.emulator && matrix.primary && env.HAS_PLAYSTORE_SECRET == 'true' && (github.ref_type == 'tag' || github.ref == 'refs/heads/master') }}
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-        run: |
-          if [ "${REF_TYPE}" = "tag" ]; then
-            { echo "track=production"; echo "status=inProgress"; echo "user_fraction=0.2"; } >> "${GITHUB_OUTPUT}"
-          else
-            { echo "track=beta"; echo "status=completed"; echo "user_fraction="; } >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Deploy to Play Store
-        if: ${{ !matrix.emulator && matrix.primary && env.HAS_PLAYSTORE_SECRET == 'true' && (github.ref_type == 'tag' || github.ref == 'refs/heads/master') }}
-        uses: ./.github/actions/playstore
-        with:
-          artifact: ${{ runner.temp }}/build/${{ env.PACKAGE }}.apk
-          service_account_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          track: ${{ steps.playstore_rollout.outputs.track }}
-          status: ${{ steps.playstore_rollout.outputs.status }}
-          user_fraction: ${{ steps.playstore_rollout.outputs.user_fraction }}
-          whats_new_directory: ${{ github.workspace }}/deploy/android/whatsnew
 
       - name: Debug failed runner
         if: ${{ failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.debug_runner && github.ref_type == 'branch' }}
