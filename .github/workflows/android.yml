@@ -65,7 +65,7 @@ jobs:
         with:
           mode: android
           qt-host: linux
-          qt-arch: x86_64
+          qt-arch: linux_gcc_64
           aqt-source: ''
           abis: ${{ env.QT_ANDROID_ABIS }}
           build-type: ${{ env.BUILD_TYPE }}
