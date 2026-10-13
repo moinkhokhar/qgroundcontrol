@@ -30,10 +30,6 @@ on:
           - 'arm64-v8a'
           - 'armeabi-v7a'
           - 'arm64-v8a;armeabi-v7a'
-      debug_runner:
-        description: 'Open an actor-only SSH session after a failure'
-        type: boolean
-        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -51,7 +47,6 @@ jobs:
 
   build-matrix:
     needs: changes
-    # Ensure manual workflow_dispatch always runs regardless of changes detection
     if: always() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.should_build == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -84,7 +79,6 @@ jobs:
   build:
     name: Android (${{ matrix.host }})
     needs: [changes, build-matrix]
-    # Filter: Build ONLY on Linux and skip headless emulator tests to save runner hours and avoid Gradle daemon hangs
     if: (github.event_name == 'workflow_dispatch' || needs.changes.outputs.should_build == 'true') && matrix.host == 'linux' && !matrix.emulator
     runs-on: ${{ matrix.fallback_runner || 'ubuntu-24.04' }}
     timeout-minutes: 120
@@ -92,8 +86,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      id-token: write
-      attestations: write
 
     strategy:
       fail-fast: false
@@ -107,13 +99,7 @@ jobs:
     env:
       BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
       PACKAGE: QGroundControl
-      QT_ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/deploy/android/android_release.keystore
-      QT_ANDROID_KEYSTORE_ALIAS: QGCAndroidKeyStore
-      QT_ANDROID_KEYSTORE_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      QT_ANDROID_KEYSTORE_KEY_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      # Allow manual ABI selection for Skydroid G12 or fallback to matrix
       QT_ANDROID_ABIS: ${{ inputs.target_abi || matrix.android_abis || 'arm64-v8a' }}
-      HAS_PLAYSTORE_SECRET: ${{ secrets.GOOGLE_SERVICE_ACCOUNT != '' }}
 
     steps:
       - name: Harden Runner
@@ -150,9 +136,8 @@ jobs:
       - name: Install host build dependencies
         uses: ./.github/actions/install-dependencies
 
-      # Auto-generates a self-signed debug keystore so the APK can be installed on your G12
+      # Auto-generates a signed debug key so the APK installs cleanly on your Skydroid G12
       - name: Create Debug Keystore
-        if: ${{ env.QT_ANDROID_KEYSTORE_STORE_PASS == '' || !matrix.primary }}
         shell: bash
         run: |
           keytool -genkey -v \
@@ -206,15 +191,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Android Lint
-        continue-on-error: true # Prevents minor UI/XML warnings from failing the release
-        shell: bash
-        working-directory: ${{ runner.temp }}/build/android-build
-        run: |
-          if [[ -x "./gradlew" ]]; then
-            ./gradlew lintRelease --no-daemon || true
-          fi
-
       - name: Prepare Artifact
         shell: bash
         run: |
@@ -227,7 +203,7 @@ jobs:
           fi
           cp "${APK_DIR}"/*.apk "${TEMP_DIR}/build/${{ env.PACKAGE }}.apk"
 
-      # CRITICAL: Direct GitHub Actions Artifact Upload (Downloads directly from GitHub UI)
+      # Uploads APK directly to the GitHub Actions Run page for 1-click download
       - name: Upload APK to GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -236,22 +212,3 @@ jobs:
             ${{ runner.temp }}/build/${{ env.PACKAGE }}.apk
             ${{ runner.temp }}/build/android-build/*.apk
           retention-days: 14
-
-      # Only run upstream AWS upload if AWS credentials actually exist in your repository
-      - name: Attest and Upload (AWS)
-        if: ${{ secrets.AWS_ROLE_ARN != '' }}
-        uses: ./.github/actions/attest-and-upload
-        with:
-          artifact-name: ${{ env.PACKAGE }}.apk
-          package-name: ${{ format('{0}-{1}-{2}', env.PACKAGE, matrix.host, matrix.artifact_abi_suffix) }}
-          subject-name: ${{ env.PACKAGE }}-${{ matrix.host }}
-          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
-          aws-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-distribution-id: ${{ secrets.AWS_DISTRIBUTION_ID }}
-          upload-aws: ${{ matrix.primary }}
-
-      - name: Debug failed runner
-        if: ${{ failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.debug_runner && github.ref_type == 'branch' }}
-        timeout-minutes: 15
-        uses: ./.github/actions/debug-runner
