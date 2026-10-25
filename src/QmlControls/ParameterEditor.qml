@@ -9,7 +9,7 @@ import QGroundControl.FactControls
 
 Item {
     id:         _root
-
+    property bool adminAuthenticated: false
     property Fact   _editorDialogFact: Fact { }
     property int    _rowHeight:         ScreenTools.defaultFontPixelHeight * 2
     property int    _rowWidth:          10 // Dynamic adjusted at runtime
@@ -451,4 +451,59 @@ Item {
             }
         }
     }
-}
+// =========================================================================
+    // PASSWORD LOCK OVERLAY FOR PARAMETER EDITOR
+    // =========================================================================
+    Rectangle {
+        anchors.fill: parent
+        visible: !_root.adminAuthenticated
+        color: "#F510141D"
+        z: 9999
+
+        MouseArea { anchors.fill: parent } // Blocks all clicks underneath
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 16
+
+            Text {
+                text: "🔒 Parameters Protected"
+                color: "white"
+                font.bold: true
+                font.pixelSize: 22
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            Text {
+                text: "Enter Administrator Password to view or edit parameters:"
+                color: "#90A4AE"
+                font.pixelSize: 13
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            TextField {
+                id: paramLockInput
+                width: 260
+                echoMode: TextInput.Password
+                placeholderText: "Password"
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            Row {
+                spacing: 12
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                QGCButton {
+                    text: qsTr("Unlock Parameters")
+                    onClicked: {
+                        if (paramLockInput.text === "admin123") {
+                            _root.adminAuthenticated = true;
+                            paramLockInput.text = "";
+                        } else {
+                            paramLockInput.text = "";
+                        }
+                    }
+                }
+            }
+        }
+    }}
